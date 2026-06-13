@@ -63,8 +63,45 @@ Hệ thống nhận event thanh toán thành công từ hệ thống tài chính
 
 ### Communication pattern:
 - **North-South (Client → Services):** `Client → Nginx → API Gateway → Service`
-- **East-West (Service → Service):** Internal Docker DNS trực tiếp (ví dụ: `http://auth-service:8080`), không đi qua Gateway.
+- **East-West (Service → Service):** Internal Docker DNS trực tiếp (ví dụ: `http://auth-service:8081`), không đi qua Gateway.
 - **Async:** RabbitMQ với Transactional Outbox pattern.
+
+### Maven Multi-Module Structure:
+
+```
+coupon-system (root, packaging=pom)
+├── pom.xml                 -- parent POM, dependencyManagement
+├── common/                 -- shared module
+│   ├── event/              -- OrderPlacedEvent, RedeemCommandEvent, RedeemResultEvent, NotificationEvent
+│   ├── constant/           -- RabbitMQ exchange/queue/routing-key constants
+│   └── exception/          -- shared exception classes (optional)
+├── config-server/
+├── eureka-server/
+├── api-gateway/
+├── auth-service/
+├── coupon-service/
+├── order-service/
+└── notification-service/
+```
+
+**Root `pom.xml`:**
+- `<packaging>pom</packaging>`, liệt kê toàn bộ `<modules>`.
+- `dependencyManagement`: import Spring Boot BOM + Spring Cloud BOM (cho gateway/eureka/config).
+- Properties chung: `java.version=21`, version Spring Boot/Spring Cloud.
+- Tất cả module share cùng `<version>` (ví dụ `1.0.0-SNAPSHOT`) — đơn giản cho demo.
+
+**`common` module:**
+- Dependency của `coupon-service`, `order-service`, `notification-service` (3 service tham gia event flow qua RabbitMQ). KHÔNG cần cho `auth-service`, `api-gateway`, `config-server`, `eureka-server`.
+- Định nghĩa **canonical DTO** cho 4 event payload: `OrderPlacedEvent`, `RedeemCommandEvent` (field `reward_amount` — mục 5), `RedeemResultEvent`, `NotificationEvent` (field `dedup_key` — mục 4.4).
+- Cả producer và consumer cùng import 1 class từ `common` — nếu field không khớp giữa 2 bên (ví dụ `amount` vs `reward_amount`), compiler báo lỗi ngay lúc build, không thể tái diễn lỗi field-mismatch.
+- Chứa constant class cho exchange/queue/routing-key names (mục 5) — tránh hardcode string rải rác ở nhiều service.
+
+**Mỗi service module:**
+- `spring-boot-maven-plugin` để build executable jar.
+- Dockerfile riêng, multi-stage build (`maven:3.9-eclipse-temurin-21` cho build stage, `eclipse-temurin:21-jre-alpine` cho runtime).
+- Build trong Docker dùng `mvn package -pl {service} -am` — flag `-am` đảm bảo build luôn cả `common` trước.
+
+**Build command ở root:** `mvn clean package` — Maven Reactor tự tính dependency order.
 
 ---
 
@@ -102,22 +139,25 @@ CREATE INDEX idx_orders_user ON orders(user_id, created_at DESC);
 
 -- Bảng wallet_transactions (Wallet Mock idempotency guard)
 CREATE TABLE wallet_transactions (
-    txn_id     VARCHAR(128) PRIMARY KEY,         -- Idempotency key từ REDEEM_COMMAND
-    user_id    VARCHAR(64) NOT NULL,
-    coupon_id  BIGINT NOT NULL,
-    amount     NUMERIC(19, 4) NOT NULL,
-    created_at TIMESTAMP NOT NULL DEFAULT NOW()
+    txn_id        VARCHAR(128) PRIMARY KEY,      -- Idempotency key từ REDEEM_COMMAND
+    user_id       VARCHAR(64) NOT NULL,
+    coupon_id     BIGINT NOT NULL,
+    reward_amount NUMERIC(19, 4) NOT NULL,
+    created_at    TIMESTAMP NOT NULL DEFAULT NOW()
 );
 
 -- Outbox table (Order Service)
 CREATE TABLE outbox (
-    id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    aggregate_type VARCHAR(64) NOT NULL,
-    aggregate_id   VARCHAR(128) NOT NULL,
-    event_type     VARCHAR(64) NOT NULL,          -- ORDER_PLACED, REDEEM_RESULT
-    payload        JSONB NOT NULL,
-    status         VARCHAR(16) NOT NULL DEFAULT 'PENDING',  -- PENDING, SENT
-    created_at     TIMESTAMP NOT NULL DEFAULT NOW()
+    id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    aggregate_type    VARCHAR(64) NOT NULL,
+    aggregate_id      VARCHAR(128) NOT NULL,
+    event_type        VARCHAR(64) NOT NULL,          -- ORDER_PLACED, REDEEM_RESULT
+    payload           JSONB NOT NULL,
+    status            VARCHAR(16) NOT NULL DEFAULT 'PENDING',  -- PENDING, SENT
+    retry_count       INT NOT NULL DEFAULT 0,        -- Số lần publish thất bại
+    last_error        TEXT,                          -- Lỗi gần nhất khi publish thất bại
+    last_attempted_at TIMESTAMP,                      -- Lần thử publish gần nhất
+    created_at        TIMESTAMP NOT NULL DEFAULT NOW()
 );
 CREATE INDEX idx_outbox_status ON outbox(status, created_at) WHERE status = 'PENDING';
 ```
@@ -133,7 +173,9 @@ CREATE TABLE coupons (
                   -- AVAILABLE : sẵn sàng dùng
                   -- PENDING   : đang bị lock, chờ wallet xác nhận (tạm thời)
                   -- REDEEMED  : wallet confirm thành công (terminal)
-                  -- FAILED    : hết lần retry, cần admin can thiệp (terminal)
+                  -- BLOCKED   : hết lần retry, KHÔNG xác nhận được kết quả với wallet —
+                  --             cần admin kiểm tra thủ công rồi set lại REDEEMED/AVAILABLE
+                  --             (terminal đối với automation, KHÔNG terminal về business)
                   -- EXPIRED   : hết hạn (terminal)
     reward_amount NUMERIC(19, 4) NOT NULL,        -- Số tiền thưởng khi redeem
     expired_at    TIMESTAMP,                      -- NULL = không bao giờ hết hạn
@@ -150,10 +192,14 @@ CREATE TABLE transaction_tracking (
     coupon_id   BIGINT REFERENCES coupons(id),
     status      VARCHAR(16) NOT NULL DEFAULT 'INIT',
                 -- INIT         : tracking created, chờ outbox relay publish command
-                -- COMMAND_SENT : REDEEM_COMMAND đã publish lên queue, chờ result
+                -- COMMAND_SENT : REDEEM_COMMAND đã publish (at-least-once, xem mục 12), chờ result
                 -- SUCCESS      : wallet confirm thành công
                 -- FAILED       : wallet 4xx hoặc hết retry
-    payload     JSONB NOT NULL,                  -- Dữ liệu để replay nếu cần
+    payload     JSONB NOT NULL,
+                -- QUAN TRỌNG: đây là CANONICAL REDEEM_COMMAND payload
+                -- {txn_id, user_id, coupon_id, reward_amount}
+                -- Set 1 lần khi insert (Giai đoạn 2), dùng nguyên trạng khi
+                -- Recovery Job re-publish (mục 6.5). KHÔNG phải ORDER_PLACED payload.
     retry_count INT NOT NULL DEFAULT 0,          -- Max: 5
     last_error  TEXT,
     created_at  TIMESTAMP NOT NULL DEFAULT NOW(),
@@ -167,14 +213,17 @@ CREATE INDEX idx_tracking_user ON transaction_tracking(user_id);
 
 -- Outbox table (Coupon Service)
 CREATE TABLE outbox (
-    id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    aggregate_type VARCHAR(64) NOT NULL,
-    aggregate_id   VARCHAR(128) NOT NULL,
-    event_type     VARCHAR(64) NOT NULL,
-                   -- REDEEM_COMMAND, NOTIFICATION_EVENT
-    payload        JSONB NOT NULL,
-    status         VARCHAR(16) NOT NULL DEFAULT 'PENDING',
-    created_at     TIMESTAMP NOT NULL DEFAULT NOW()
+    id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    aggregate_type    VARCHAR(64) NOT NULL,
+    aggregate_id      VARCHAR(128) NOT NULL,
+    event_type        VARCHAR(64) NOT NULL,
+                      -- REDEEM_COMMAND, NOTIFICATION_EVENT
+    payload           JSONB NOT NULL,
+    status            VARCHAR(16) NOT NULL DEFAULT 'PENDING',
+    retry_count       INT NOT NULL DEFAULT 0,        -- Số lần publish thất bại
+    last_error        TEXT,                          -- Lỗi gần nhất khi publish thất bại
+    last_attempted_at TIMESTAMP,                      -- Lần thử publish gần nhất
+    created_at        TIMESTAMP NOT NULL DEFAULT NOW()
 );
 CREATE INDEX idx_outbox_status ON outbox(status, created_at) WHERE status = 'PENDING';
 ```
@@ -185,6 +234,7 @@ CREATE INDEX idx_outbox_status ON outbox(status, created_at) WHERE status = 'PEN
 -- Bảng notifications
 CREATE TABLE notifications (
     id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    dedup_key  VARCHAR(160) NOT NULL UNIQUE,    -- Idempotency key: "{txn_id}:{type}" hoặc job-specific key
     user_id    VARCHAR(64) NOT NULL,
     type       VARCHAR(32) NOT NULL,
                -- REDEEM_FAILED, REDEEM_SUCCESS, ADMIN_ALERT
@@ -239,6 +289,8 @@ notification.dlq.exchange (direct)
   └─> notification.dlq.queue
 ```
 
+**Lưu ý — Retry delay:** Demo dùng fixed TTL 5s cho `order.retry.queue` (choice có chủ đích để giảm độ phức tạp, không phải bỏ sót). Khi production hóa, có thể đổi sang exponential backoff nhiều tầng (`retry.queue.1` TTL 5s → `retry.queue.2` TTL 15s → `retry.queue.3` TTL 60s), chọn queue dựa trên `x-death` count.
+
 ### Event Payloads:
 
 **ORDER_PLACED** (Order Service → Coupon Service):
@@ -285,6 +337,7 @@ Hoặc khi lỗi:
 **NOTIFICATION_EVENT** (Coupon Service → Notification Service):
 ```json
 {
+  "dedup_key": "TXN_STOCK_20240101_001:REDEEM_FAILED",
   "user_id": "USER_123",
   "type": "REDEEM_FAILED",
   "title": "Redeem thất bại",
@@ -292,6 +345,7 @@ Hoặc khi lỗi:
   "admin_alert": true
 }
 ```
+**Lưu ý:** `dedup_key` dùng pattern `{txn_id}:{type}` (hoặc job-specific key cho các job định kỳ) — là idempotency key cho `notifications.dedup_key` (xem mục 4.4), tránh insert trùng khi outbox retry publish.
 
 ---
 
@@ -309,7 +363,7 @@ Hoặc khi lỗi:
 
 **Validate (mỗi request qua Gateway):**
 1. API Gateway extract Bearer token từ `Authorization` header.
-2. Gọi Auth Service (`http://auth-service:8080/auth/validate`) qua internal DNS.
+2. Gọi Auth Service (`http://auth-service:8081/auth/validate`) qua internal DNS.
 3. Auth Service check token trong Redis còn tồn tại không (stateful check).
 4. Nếu valid → trả `{user_id}`, Gateway forward request kèm header `X-User-Id: {user_id}`.
 5. Nếu invalid → Gateway trả 401.
@@ -337,8 +391,9 @@ Hoặc khi lỗi:
 4. **Outbox Relay** (`@Scheduled`, mỗi 5 giây):
     - Query `SELECT * FROM outbox WHERE status='PENDING' ORDER BY created_at ASC FOR UPDATE SKIP LOCKED`.
     - `SKIP LOCKED` đảm bảo an toàn khi chạy multi-instance — mỗi instance chỉ xử lý các record chưa bị instance khác lock.
-    - Publish từng record lên `order.exchange`.
-    - Update `outbox.status = 'SENT'`.
+    - Với mỗi record, wrap trong try/catch (lỗi 1 record KHÔNG abort cả batch):
+        - **try:** publish lên `order.exchange` → `UPDATE outbox SET status='SENT'`.
+        - **catch** (ví dụ RabbitMQ down): `UPDATE outbox SET retry_count = retry_count + 1, last_error = ex.message, last_attempted_at = NOW()`. Record vẫn `PENDING`, relay lần sau (5s) tự thử lại. Tiếp tục record kế tiếp.
 
 ---
 
@@ -391,6 +446,8 @@ Mở DB Transaction:
    (txn_id, user_id, coupon_id, status, payload)
    VALUES (?, ?, ?, 'INIT', ?)
    -- Nếu DuplicateKeyException:
+   --   Log WARN {event: "idempotency_duplicate", txn_id, source: "transaction_tracking"}
+   --   increment coupon.idempotency.duplicate.total
    --   Rollback, Release Redis Lock, ACK, RETURN (đã xử lý rồi)
 
 5. INSERT INTO outbox
@@ -413,14 +470,20 @@ Mở DB Transaction:
 **Giai đoạn 3: Outbox Relay** (`@Scheduled`, mỗi 5 giây)
 ```
 SELECT * FROM outbox WHERE status='PENDING' ORDER BY created_at ASC FOR UPDATE SKIP LOCKED
-Với mỗi record:
-  - Nếu event_type == 'REDEEM_COMMAND':
-      publish lên redeem.command.exchange
-      UPDATE transaction_tracking SET status='COMMAND_SENT', updated_at=NOW()
-      WHERE txn_id = outbox.aggregate_id
-  - Nếu event_type == 'NOTIFICATION_EVENT':
-      publish lên notification.exchange
-  - Update outbox.status = 'SENT'
+Với mỗi record, wrap trong try/catch (lỗi 1 record KHÔNG abort cả batch):
+  try:
+    Nếu event_type == 'REDEEM_COMMAND':
+        publish lên redeem.command.exchange
+        UPDATE transaction_tracking SET status='COMMAND_SENT', updated_at=NOW()
+        WHERE txn_id = outbox.aggregate_id
+    Nếu event_type == 'NOTIFICATION_EVENT':
+        publish lên notification.exchange
+    UPDATE outbox SET status='SENT'
+  catch (ví dụ RabbitMQ down):
+    UPDATE outbox SET retry_count = retry_count + 1,
+                       last_error = ex.message,
+                       last_attempted_at = NOW()
+    -- Record vẫn PENDING, relay lần sau tự thử lại. Tiếp tục record kế tiếp.
 ```
 
 ---
@@ -468,7 +531,8 @@ ACK message
 
 ```
 -- Distributed lock để tránh nhiều instance chạy đồng thời
--- SET recovery_job_lock {uuid} NX EX 300 — nếu không lấy được lock thì skip lần này
+-- SET recovery_job_lock {uuid} NX EX 600 — TTL = 2× fixedDelay (xem mục 11)
+-- nếu không lấy được lock thì skip lần này
 
 -- Query cả 2 trạng thái:
 -- INIT         : outbox relay chưa chạy, hoặc relay đã publish + commit outbox.SENT
@@ -496,12 +560,16 @@ Với mỗi bản ghi:
 
     Nếu retry_count + 1 >= 5:
       UPDATE transaction_tracking SET status='FAILED'
-      UPDATE coupons SET status='FAILED' WHERE id = tracking.coupon_id
-      -- PENDING → FAILED: hết retry, cần admin can thiệp
+      -- transaction_tracking.FAILED: record này không đạt SUCCESS (đúng nghĩa, giữ nguyên)
+      UPDATE coupons SET status='BLOCKED' WHERE id = tracking.coupon_id
+      -- PENDING → BLOCKED: hệ thống KHÔNG xác nhận được kết quả với wallet sau 5 lần retry.
+      -- KHÔNG có nghĩa coupon bị lỗi/invalid — chỉ là automation hết khả năng xác nhận.
+      -- Admin phải kiểm tra log Wallet để biết thực tế đã redeem hay chưa,
+      -- rồi set tay coupons.status về REDEEMED (nếu đã redeem) hoặc AVAILABLE (nếu chưa).
       INSERT INTO outbox (event_type='NOTIFICATION_EVENT', payload={
         user_id: tracking.user_id,
         type='ADMIN_ALERT',
-        message='txn_id {txn_id} đã retry 5 lần, cần can thiệp thủ công',
+        message='txn_id {txn_id} hết 5 lần retry, coupon #{coupon_id} chuyển BLOCKED — cần kiểm tra Wallet và resolve thủ công',
         admin_alert: true
       })
   COMMIT
@@ -516,16 +584,19 @@ Với mỗi bản ghi:
 **Consumer:** Lắng nghe `redeem.command.queue`
 
 ```
-Nhận REDEEM_COMMAND {txn_id, user_id, coupon_id, amount}:
+Nhận REDEEM_COMMAND {txn_id, user_id, coupon_id, reward_amount}:
 
 [Happy path — luôn thành công]
 
 Mở DB Transaction:
   -- Idempotency guard: nếu txn_id đã tồn tại thì bỏ qua (đã xử lý rồi)
-  INSERT INTO wallet_transactions (txn_id, user_id, coupon_id, amount)
+  INSERT INTO wallet_transactions (txn_id, user_id, coupon_id, reward_amount)
   VALUES (?, ?, ?, ?)
   ON CONFLICT (txn_id) DO NOTHING
-  -- Nếu bị conflict (duplicate): ACK và RETURN
+  -- Nếu bị conflict (duplicate):
+  --   Log WARN {event: "idempotency_duplicate", txn_id, source: "wallet_transactions"}
+  --   increment wallet.idempotency.duplicate.total
+  --   ACK và RETURN (KHÔNG publish lại REDEEM_RESULT)
 
   INSERT INTO outbox (aggregate_type, aggregate_id, event_type, payload)
   VALUES ('wallet', txn_id, 'REDEEM_RESULT', {
@@ -570,14 +641,17 @@ WHERE expired_at < NOW()
 
 Log số lượng coupon vừa bị expire.
 
--- Alert admin về các coupon PENDING đã quá hạn (kẹt, cần xử lý thủ công)
+-- Alert admin về các coupon đang "kẹt" (PENDING hoặc BLOCKED) mà đã quá hạn
 SELECT COUNT(*) FROM coupons
 WHERE expired_at < NOW()
-  AND status = 'PENDING'
+  AND status IN ('PENDING', 'BLOCKED')
 -- Nếu count > 0: INSERT notification ADMIN_ALERT để admin xử lý thủ công
 ```
 
-**Lưu ý:** Coupon `PENDING` quá hạn KHÔNG được tự động expire — chúng đang trong trạng thái "chờ wallet xác nhận" hoặc "cần admin can thiệp". Tự động expire có thể gây mất dữ liệu. Chỉ alert admin để xử lý thủ công.
+**Lưu ý:**
+- `PENDING` và `BLOCKED` đã quá `expired_at` KHÔNG được tự động chuyển `EXPIRED` — đây là các trạng thái "đang chờ kết quả wallet" / "cần admin resolve" (operational), khác với `EXPIRED` (business, terminal). Tự động expire ở đây có thể ghi đè/che mất kết quả thật từ Wallet.
+- `EXPIRED` và `REDEEMED` là terminal về business. `BLOCKED` chỉ terminal đối với automation, KHÔNG terminal về business — sau khi admin set tay về `REDEEMED`/`AVAILABLE`, job này sẽ expire nó ở lần chạy kế tiếp nếu vẫn còn `AVAILABLE` và đã quá hạn.
+- Job này chỉ alert, không tự resolve `PENDING`/`BLOCKED`.
 
 ---
 
@@ -633,7 +707,7 @@ Tất cả cần `X-User-Id` header (được Gateway inject sau khi validate to
 | `access_token:{user_id}` | 15 phút | Stateful auth |
 | `refresh_token:{user_id}` | 7 ngày | Stateful auth |
 | `user_lock:{user_id}` | 60 giây | Distributed lock (coupon processing). TTL 60s > DB transaction timeout 30s — đảm bảo lock không bao giờ expire trước khi transaction xong. |
-| `recovery_job_lock` | 300 giây | Distributed lock cho Recovery Job — đảm bảo chỉ 1 instance chạy job tại một thời điểm. |
+| `recovery_job_lock` | 600 giây | Distributed lock cho Recovery Job — đảm bảo chỉ 1 instance chạy job tại một thời điểm. TTL = 2× `fixedDelay` (300s), tránh trường hợp 1 lần chạy gần chạm 5 phút khiến lock hết hạn ngay trước khi lần chạy kế tiếp bắt đầu. |
 
 **Distributed Lock release** dùng Lua script (atomic check-and-delete):
 ```lua
@@ -716,9 +790,15 @@ Business metrics cần có:
 - `coupon.match.miss.total` (counter — không có coupon nào match)
 - `transaction.command_sent.count` (gauge — số bản ghi COMMAND_SENT đang chờ result)
 - `coupon.pending.count` (gauge — số coupon ở trạng thái PENDING, đang bị lock)
-- `coupon.failed.count` (gauge — số coupon FAILED, cần admin)
+- `coupon.blocked.count` (gauge — số coupon ở trạng thái BLOCKED, cần admin resolve thủ công)
 - `recovery.job.processed.total` (counter)
 - `outbox.relay.latency` (timer — latency từ khi insert outbox đến khi publish)
+
+**Idempotency & Outbox health (xem mục 12):**
+- `coupon.idempotency.duplicate.total` (counter — duplicate trên `transaction_tracking` PK)
+- `wallet.idempotency.duplicate.total` (counter — duplicate trên `wallet_transactions` PK)
+- `outbox.relay.failure.total` (counter, tag: `service`, `event_type` — publish thất bại, đã tăng `retry_count`)
+- `outbox.pending.backlog.count` (gauge — số record `PENDING` có `created_at` cũ hơn 1 phút)
 
 ### Distributed Tracing
 - Stack: Micrometer Tracing + OpenTelemetry → Tempo.
@@ -729,10 +809,13 @@ Business metrics cần có:
 
 ### Alerting Rules
 - `transaction.command_sent.count > 100` trong 10 phút → Wallet Service có vấn đề.
-- `coupon.failed.count` tăng > 10 trong 1 giờ → Admin cần kiểm tra.
+- `coupon.blocked.count` tăng > 10 trong 1 giờ → Admin cần kiểm tra.
 - `coupon.pending.count` tăng đột biến → có thể wallet đang chậm.
 - Recovery Job không chạy trong 15 phút → Job chết.
 - Retry queue depth > 50 → Lock contention cao bất thường.
+- `outbox.pending.backlog.count > 0` kéo dài 5 phút → RabbitMQ có thể down, outbox relay không publish được.
+- Bất kỳ outbox record có `retry_count > 10` → cần investigate thủ công, không tự healing.
+- `coupon.idempotency.duplicate.total` hoặc `wallet.idempotency.duplicate.total` tăng bất thường → dấu hiệu redelivery rate cao (lock contention, retry loop, hoặc consumer crash liên tục).
 
 ---
 
@@ -814,7 +897,7 @@ Mỗi service có connection string trỏ đến database của mình: `jdbc:pos
 
 15. **Single session per user — intentional:** Mỗi `user_id` chỉ có 1 access token tại một thời điểm (`SET access_token:{user_id} ...` overwrite token cũ). Login từ device mới sẽ kick device cũ. Đây là thiết kế có chủ ý cho demo. Nếu cần multi-device sau này thì đổi key thành `access_token:{user_id}:{device_id}`.
 
-16. **Transaction Isolation Level:** Atomic transaction trong coupon-service phải dùng `@Transactional(isolation = Isolation.REPEATABLE_READ)` — tránh phantom read khi `SELECT FOR UPDATE` chạy song song. PostgreSQL default là `READ COMMITTED`, không đủ cho flow này.
+16. **Transaction Isolation Level:** Atomic transaction trong coupon-service dùng `READ COMMITTED` (default của PostgreSQL/Spring) — KHÔNG ép `REPEATABLE_READ`. `SELECT ... FOR UPDATE` đã lock đúng các row coupon liên quan; kết hợp với Redis distributed lock (mục 11) và unique PK `transaction_tracking.txn_id` là đủ để đảm bảo các invariant chính (không double-spend, tuần tự per user). `REPEATABLE_READ` không tăng thêm bảo vệ có ý nghĩa cho flow này, nhưng làm tăng khả năng serialization conflict/retry không cần thiết.
 
 17. **Graceful Shutdown:** Thêm vào config: `spring.lifecycle.timeout-per-shutdown-phase=30s`. Consumer cần xử lý xong in-flight message trước khi container stop — Spring AMQP tự handle nếu config đúng lifecycle timeout.
 

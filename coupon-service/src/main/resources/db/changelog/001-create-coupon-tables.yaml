@@ -1,0 +1,184 @@
+databaseChangeLog:
+  - changeSet:
+      id: 1-create-coupon-tables
+      author: coupon-system
+      changes:
+        - createTable:
+            tableName: coupons
+            columns:
+              - column:
+                  name: id
+                  type: bigserial
+                  constraints:
+                    primaryKey: true
+              - column:
+                  name: user_id
+                  type: varchar(64)
+                  constraints:
+                    nullable: false
+              - column:
+                  name: status
+                  type: varchar(16)
+                  defaultValue: AVAILABLE
+                  constraints:
+                    nullable: false
+              - column:
+                  name: reward_amount
+                  type: numeric(19,4)
+                  constraints:
+                    nullable: false
+              - column:
+                  name: expired_at
+                  type: timestamp
+              - column:
+                  name: conditions
+                  type: jsonb
+              - column:
+                  name: created_at
+                  type: timestamp
+                  defaultValueComputed: NOW()
+                  constraints:
+                    nullable: false
+        - createIndex:
+            tableName: coupons
+            indexName: idx_coupons_user_status
+            columns:
+              - column:
+                  name: user_id
+              - column:
+                  name: status
+        - createIndex:
+            tableName: coupons
+            indexName: idx_coupons_expired_at
+            columns:
+              - column:
+                  name: expired_at
+
+  - changeSet:
+      id: 2-create-transaction-tracking-table
+      author: coupon-system
+      changes:
+        - createTable:
+            tableName: transaction_tracking
+            columns:
+              - column:
+                  name: txn_id
+                  type: varchar(128)
+                  constraints:
+                    primaryKey: true
+              - column:
+                  name: user_id
+                  type: varchar(64)
+                  constraints:
+                    nullable: false
+              - column:
+                  name: coupon_id
+                  type: bigint
+              - column:
+                  name: status
+                  type: varchar(16)
+                  defaultValue: INIT
+                  constraints:
+                    nullable: false
+              - column:
+                  name: payload
+                  type: jsonb
+                  constraints:
+                    nullable: false
+              - column:
+                  name: retry_count
+                  type: int
+                  defaultValue: 0
+              - column:
+                  name: last_error
+                  type: text
+              - column:
+                  name: created_at
+                  type: timestamp
+                  defaultValueComputed: NOW()
+                  constraints:
+                    nullable: false
+              - column:
+                  name: updated_at
+                  type: timestamp
+                  defaultValueComputed: NOW()
+                  constraints:
+                    nullable: false
+        - createIndex:
+            tableName: transaction_tracking
+            indexName: idx_tracking_recovery
+            columns:
+              - column:
+                  name: status
+              - column:
+                  name: updated_at
+        - createIndex:
+            tableName: transaction_tracking
+            indexName: idx_tracking_user
+            columns:
+              - column:
+                  name: user_id
+
+  - changeSet:
+      id: 3-create-outbox-table
+      author: coupon-system
+      changes:
+        - createTable:
+            tableName: outbox
+            columns:
+              - column:
+                  name: id
+                  type: uuid
+                  defaultValueComputed: gen_random_uuid()
+                  constraints:
+                    primaryKey: true
+              - column:
+                  name: aggregate_type
+                  type: varchar(64)
+                  constraints:
+                    nullable: false
+              - column:
+                  name: aggregate_id
+                  type: varchar(128)
+                  constraints:
+                    nullable: false
+              - column:
+                  name: event_type
+                  type: varchar(64)
+                  constraints:
+                    nullable: false
+              - column:
+                  name: payload
+                  type: jsonb
+                  constraints:
+                    nullable: false
+              - column:
+                  name: status
+                  type: varchar(16)
+                  defaultValue: PENDING
+                  constraints:
+                    nullable: false
+              - column:
+                  name: retry_count
+                  type: int
+                  defaultValue: 0
+              - column:
+                  name: last_error
+                  type: text
+              - column:
+                  name: last_attempted_at
+                  type: timestamp
+              - column:
+                  name: created_at
+                  type: timestamp
+                  defaultValueComputed: NOW()
+                  constraints:
+                    nullable: false
+        - createIndex:
+            tableName: outbox
+            indexName: idx_outbox_status
+            columns:
+              - column:
+                  name: status
+              - column:
+                  name: created_at

@@ -1,0 +1,19 @@
+﻿databaseChangeLog:
+  - changeSet:
+      id: 1-create-users-table
+      author: coupon-system
+      changes:
+        - createTable:
+            tableName: users
+            columns:
+              - column:
+                  name: user_id
+                  type: varchar(64)
+                  constraints:
+                    primaryKey: true
+              - column:
+                  name: created_at
+                  type: timestamp
+                  defaultValueComputed: NOW()
+                  constraints:
+                    nullable: false

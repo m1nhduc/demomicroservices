@@ -206,7 +206,10 @@ docker-compose up -d
 
 ## Notes
 
-1. **Java Version**: Set to 11 for compatibility. Docker images will use Java 11 base.
+1. **Java Version**: Set to **Java 21** per README requirements
+   - Local build requires Java 21+
+   - Docker will use Java 21 (eclipse-temurin:21-jre-alpine)
+   - Multi-stage builds handle compilation inside Docker
 2. **Spring Boot Version**: 3.3.4 (latest stable)
 3. **Spring Cloud Version**: 2023.0.3 (compatible with Spring Boot 3.3.x)
 4. **Architecture**: Event-driven, choreography-based SAGA

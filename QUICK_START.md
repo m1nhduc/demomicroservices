@@ -7,15 +7,13 @@
 cd f:\prj\demomicroservices
 ```
 
-### 2. Check Java Version (Must have Java 11+)
+### 2. Check Java Version (**Must have Java 21**+)
 ```bash
 java -version
 ```
-If you only have Java 8, use Docker instead:
-```bash
-docker-compose build
-docker-compose up
-```
+**Note:** Java 21+ is REQUIRED per README specifications
+- If you only have Java 8, use Docker to build (has Java 21)
+- Docker Compose builds automatically with Java 21
 
 ### 3. Build All Modules (if Java 11+ available)
 ```bash

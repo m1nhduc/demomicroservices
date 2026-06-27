@@ -495,23 +495,42 @@ Với mỗi record, wrap trong try/catch (lỗi 1 record KHÔNG abort cả batch
 ```
 Nhận REDEEM_RESULT message {txn_id, success, error_code}:
 
+-- Bước 0: Orphan check
+SELECT * FROM transaction_tracking WHERE txn_id = ?
+Nếu null:
+  Log ERROR {event: "orphan_result", txn_id}
+  increment result.orphan.total (metric)
+  publish sang redeem.result.dlq.queue
+  ACK và RETURN
+
 Nếu success == true:
   Mở DB Transaction:
+    -- WHERE guard: chỉ transition nếu tracking còn ở trạng thái chưa xử lý
     UPDATE transaction_tracking SET status='SUCCESS', updated_at=NOW()
-    WHERE txn_id = ?
+    WHERE txn_id = ? AND status IN ('INIT', 'COMMAND_SENT')
+
+    -- WHERE guard: chỉ transition nếu coupon còn PENDING (chưa bị admin resolve)
     UPDATE coupons SET status='REDEEMED'
-    WHERE id = (SELECT coupon_id FROM transaction_tracking WHERE txn_id = ?)
-    -- PENDING → REDEEMED: wallet đã confirm, coupon chính thức được dùng
+    WHERE id = ? AND status = 'PENDING'
+
+    -- Nếu affected_rows == 0 ở một trong hai UPDATE:
+    --   Message bị redeliver, state đã được xử lý rồi → skip silently, không lỗi
+    --   Log INFO {event: "result_consumer_skip", txn_id, reason: "already_processed"}
   COMMIT
 
 Nếu success == false (error_code != null):
   Mở DB Transaction:
     UPDATE transaction_tracking
     SET status='FAILED', last_error=error_code, updated_at=NOW()
-    WHERE txn_id = ?
+    WHERE txn_id = ? AND status IN ('INIT', 'COMMAND_SENT')
+
+    -- Trả coupon về AVAILABLE để transaction khác có thể dùng
     UPDATE coupons SET status='AVAILABLE'
-    WHERE id = (SELECT coupon_id FROM transaction_tracking WHERE txn_id = ?)
-    -- PENDING → AVAILABLE: wallet fail, release coupon để transaction khác có thể dùng
+    WHERE id = ? AND status = 'PENDING'
+
+    -- WHERE guard tương tự: nếu affected_rows == 0 → đã xử lý rồi, skip
+
+    -- Chỉ insert notification nếu tracking update thành công (affected_rows > 0)
     INSERT INTO outbox (event_type='NOTIFICATION_EVENT', payload={
       user_id, type='REDEEM_FAILED',
       title='Redeem thất bại',
@@ -589,15 +608,22 @@ Nhận REDEEM_COMMAND {txn_id, user_id, coupon_id, reward_amount}:
 [Happy path — luôn thành công]
 
 Mở DB Transaction:
-  -- Idempotency guard: nếu txn_id đã tồn tại thì bỏ qua (đã xử lý rồi)
+  -- Idempotency guard
   INSERT INTO wallet_transactions (txn_id, user_id, coupon_id, reward_amount)
   VALUES (?, ?, ?, ?)
   ON CONFLICT (txn_id) DO NOTHING
-  -- Nếu bị conflict (duplicate):
+
+  -- Kiểm tra rows_affected:
+  -- rows_affected == 1 (new)     → insert mới thành công, publish result bình thường
+  -- rows_affected == 0 (duplicate) → đã xử lý trước đó, NHƯNG vẫn phải publish REDEEM_RESULT
+  --   Lý do: Recovery Job có thể đã re-send REDEEM_COMMAND vì result lần trước bị mất
+  --   (Coupon Service crash trước khi consume). Nếu im lặng → Recovery tiếp tục retry
+  --   → coupon bị BLOCKED oan dù wallet đã xử lý thành công.
+  --   Coupon Service result consumer có WHERE guard trên status → idempotent, safe.
   --   Log WARN {event: "idempotency_duplicate", txn_id, source: "wallet_transactions"}
   --   increment wallet.idempotency.duplicate.total
-  --   ACK và RETURN (KHÔNG publish lại REDEEM_RESULT)
 
+  -- Dù new hay duplicate: LUÔN insert REDEEM_RESULT vào outbox
   INSERT INTO outbox (aggregate_type, aggregate_id, event_type, payload)
   VALUES ('wallet', txn_id, 'REDEEM_RESULT', {
     txn_id: txn_id,
@@ -616,9 +642,13 @@ ACK message
 **Consumer:** Lắng nghe `notification.queue`
 
 ```
-Nhận NOTIFICATION_EVENT {user_id, type, title, message, admin_alert}:
+Nhận NOTIFICATION_EVENT {dedup_key, user_id, type, title, message, admin_alert}:
 
-INSERT INTO notifications (user_id, type, title, message, status='UNREAD')
+-- Idempotency guard: dedup_key = "{txn_id}:{type}", tránh insert trùng khi outbox retry
+INSERT INTO notifications (dedup_key, user_id, type, title, message, status)
+VALUES (?, ?, ?, ?, ?, 'UNREAD')
+ON CONFLICT (dedup_key) DO NOTHING
+-- Nếu conflict → đã insert rồi, bỏ qua. ACK bình thường.
 
 Nếu admin_alert == true:
   [Placeholder: gửi Telegram/Slack webhook — implement sau]
@@ -910,3 +940,149 @@ Mỗi service có connection string trỏ đến database của mình: `jdbc:pos
     - `/actuator/prometheus` — cho Prometheus scrape
     - Config: `management.endpoints.web.exposure.include=health,prometheus`
     - `management.endpoint.health.show-details=always`
+
+---
+
+## 17. YÊU CẦU UNIT TEST
+
+**Stack:** JUnit 5 + Mockito + AssertJ. Không dùng Spring context trong unit test (không `@SpringBootTest`) — chỉ test logic thuần, mock dependencies.
+
+**Coverage target:** Tất cả các class có business logic phải đạt tối thiểu 80% line coverage. Các class chỉ là config/DTO/constant không cần test.
+
+---
+
+### 17.1. `coupon-service` — CouponMatchingService
+
+Class chứa matching logic (TODO). Phần này quan trọng nhất vì là business core.
+
+| Test case | Mô tả |
+|---|---|
+| `givenNoCoupons_whenMatch_thenReturnEmpty` | List coupon rỗng → `Optional.empty()` |
+| `givenNoMatchingCoupon_whenMatch_thenReturnEmpty` | Có coupon nhưng không ai thỏa điều kiện → `Optional.empty()` |
+| `givenOneCoupon_whenMatch_thenReturnIt` | Đúng 1 coupon match → trả về coupon đó |
+| `givenMultipleCoupons_whenMatch_thenReturnEarliestExpiry` | Nhiều coupon match → trả về coupon có `expired_at` sớm nhất |
+| `givenExpiringAndNonExpiring_whenMatch_thenExpiringFirst` | Coupon có `expired_at` luôn được ưu tiên trước coupon `expired_at = null` |
+| `givenFirstCouponNotMatch_whenMatch_thenReturnSecond` | Coupon đầu không match, coupon thứ hai match → trả về thứ hai |
+
+---
+
+### 17.2. `coupon-service` — MainConsumerService (Giai đoạn 2)
+
+Mock: `RedisLockService`, `CouponRepository`, `TransactionTrackingRepository`, `OutboxRepository`, `MeterRegistry`.
+
+| Test case | Mô tả |
+|---|---|
+| `givenLockAcquired_whenProcess_thenCommitAndAck` | Happy path: lock lấy được, match thành công, INSERT tracking, INSERT outbox, UPDATE coupon PENDING |
+| `givenLockFailed3Times_whenProcess_thenRequeue` | Redis lock fail 3 lần → publish sang retry exchange, ACK main queue |
+| `givenDuplicateTxnId_whenProcess_thenAckAndExit` | INSERT tracking throw `DuplicateKeyException` → log WARN, increment metric, ACK và exit |
+| `givenNoCouponMatch_whenProcess_thenSilentSkip` | Matching trả về empty → release lock, ACK, không INSERT gì |
+| `givenLockAcquired_thenAlwaysReleaseLock` | Dù flow thành công hay exception, Redis lock phải được release trong `finally` |
+
+---
+
+### 17.3. `coupon-service` — ResultConsumerService (Giai đoạn 4)
+
+Mock: `TransactionTrackingRepository`, `CouponRepository`, `OutboxRepository`, `MeterRegistry`.
+
+| Test case | Mô tả |
+|---|---|
+| `givenOrphanTxnId_whenConsume_thenLogAndDlq` | `txn_id` không tồn tại trong tracking → log ERROR, increment metric, push DLQ, ACK |
+| `givenSuccessResult_whenConsume_thenUpdateSuccessAndRedeemed` | `success=true` → tracking `COMMAND_SENT → SUCCESS`, coupon `PENDING → REDEEMED` |
+| `givenSuccessResultDuplicate_whenConsume_thenSkip` | tracking đã `SUCCESS` → `UPDATE ... WHERE status IN ('INIT','COMMAND_SENT')` affected_rows=0 → skip, log INFO |
+| `givenFailResult_whenConsume_thenUpdateFailedAndAvailable` | `success=false` → tracking `FAILED`, coupon `PENDING → AVAILABLE`, insert notification outbox |
+| `givenFailResultAdminResolved_whenConsume_thenSkip` | Coupon không còn `PENDING` (admin đã resolve) → `UPDATE ... WHERE status='PENDING'` affected_rows=0 → skip |
+
+---
+
+### 17.4. `coupon-service` — OutboxRelayService
+
+Mock: `OutboxRepository`, `RabbitTemplate`, `TransactionTrackingRepository`, `MeterRegistry`.
+
+| Test case | Mô tả |
+|---|---|
+| `givenRedeemCommandOutbox_whenRelay_thenPublishAndUpdateCommandSent` | REDEEM_COMMAND record → publish, UPDATE tracking `COMMAND_SENT`, UPDATE outbox `SENT` |
+| `givenNotificationOutbox_whenRelay_thenPublishOnly` | NOTIFICATION_EVENT record → publish, UPDATE outbox `SENT` (không update tracking) |
+| `givenPublishFail_whenRelay_thenIncrementRetryCountAndContinue` | RabbitMQ down → UPDATE outbox `retry_count+1`, `last_error`, status vẫn `PENDING` → tiếp tục record kế tiếp (không abort) |
+| `givenMultipleRecords_whenOnePublishFail_thenOthersStillProcessed` | Batch có 3 record, record 2 fail → record 1 và 3 vẫn được publish thành công |
+
+---
+
+### 17.5. `coupon-service` — RecoveryJobService
+
+Mock: `TransactionTrackingRepository`, `OutboxRepository`, `CouponRepository`, `RedisLockService`, `MeterRegistry`.
+
+| Test case | Mô tả |
+|---|---|
+| `givenLockNotAcquired_whenRun_thenSkip` | `recovery_job_lock` không lấy được → skip toàn bộ, không query DB |
+| `givenInitRecord_whenRun_thenReinsertOutbox` | INIT record cũ hơn 5 phút → INSERT outbox REDEEM_COMMAND, increment retry_count |
+| `givenCommandSentRecord_whenRun_thenReinsertOutbox` | COMMAND_SENT record cũ hơn 5 phút → INSERT outbox REDEEM_COMMAND, increment retry_count |
+| `givenRetryCount4_whenRun_thenBecomeBlocked` | retry_count=4 → sau khi increment lên 5: tracking `FAILED`, coupon `BLOCKED`, insert notification |
+| `givenRetryCountUnder5_whenRun_thenNotBlocked` | retry_count=3 → increment lên 4, chưa BLOCKED |
+
+---
+
+### 17.6. `order-service` — WalletMockConsumerService
+
+Mock: `WalletTransactionRepository`, `OutboxRepository`, `MeterRegistry`.
+
+| Test case | Mô tả |
+|---|---|
+| `givenNewTxnId_whenConsume_thenInsertAndPublishResult` | INSERT wallet_transactions rows_affected=1 → insert REDEEM_RESULT outbox, ACK |
+| `givenDuplicateTxnId_whenConsume_thenStillPublishResult` | INSERT rows_affected=0 (duplicate) → VẪNINSERT REDEEM_RESULT outbox, log WARN, increment metric, ACK |
+
+---
+
+### 17.7. `auth-service` — AuthService
+
+Mock: `UserRepository`, `RedisTemplate`, `JwtUtil`.
+
+| Test case | Mô tả |
+|---|---|
+| `givenNewUserId_whenRegister_thenSaveUser` | User chưa tồn tại → INSERT users |
+| `givenExistingUserId_whenRegister_thenThrowConflict` | User đã tồn tại → throw exception |
+| `givenValidUserId_whenLogin_thenReturnTokens` | Login thành công → SET access_token + refresh_token vào Redis |
+| `givenLogin_whenNewDeviceLogin_thenOverwritePreviousToken` | Login lần 2 → overwrite token cũ (single session intentional) |
+| `givenValidToken_whenValidate_thenReturnUserId` | Token tồn tại trong Redis → trả về user_id |
+| `givenExpiredToken_whenValidate_thenThrowUnauthorized` | Token không tồn tại trong Redis → throw 401 |
+| `givenValidUserId_whenLogout_thenDeleteBothTokens` | Logout → DEL access_token + refresh_token khỏi Redis |
+| `givenValidRefreshToken_whenRefresh_thenReturnNewAccessToken` | Refresh thành công → SET access_token mới, giữ nguyên refresh_token TTL |
+
+---
+
+### 17.8. `common` — RedeemCommandEvent (DTO validation)
+
+| Test case | Mô tả |
+|---|---|
+| `givenValidPayload_whenDeserialize_thenAllFieldsPresent` | JSON đầy đủ fields → deserialize thành công, `reward_amount` không null |
+| `givenMissingRewardAmount_whenDeserialize_thenFail` | Thiếu `reward_amount` → fail validation hoặc null, đảm bảo không nhầm với `amount` |
+
+---
+
+### 17.9. Test naming convention & structure
+
+```
+src/test/java/{package}/
+├── unit/                        -- pure unit tests (no Spring context)
+│   ├── CouponMatchingServiceTest.java
+│   ├── MainConsumerServiceTest.java
+│   ├── ResultConsumerServiceTest.java
+│   ├── OutboxRelayServiceTest.java
+│   ├── RecoveryJobServiceTest.java
+│   └── WalletMockConsumerServiceTest.java
+└── integration/                 -- placeholder, implement sau
+    └── (empty for demo)
+```
+
+**Naming pattern:** `given{Precondition}_when{Action}_then{ExpectedResult}`
+
+**Structure mỗi test method (AAA):**
+```java
+// Arrange — setup mocks, input
+// Act     — gọi method under test
+// Assert  — verify output + verify mock interactions (verify(...))
+```
+
+**Lưu ý:**
+- Mỗi test method chỉ test **một behavior** — không test nhiều thứ cùng lúc.
+- Mock `MeterRegistry` bằng `SimpleMeterRegistry` thay vì `mock(MeterRegistry.class)` — tránh setup phức tạp cho counter/gauge verification.
+- Test các edge case của WHERE guard: `affected_rows == 0` phải được handle, không throw exception và không gọi các step tiếp theo.

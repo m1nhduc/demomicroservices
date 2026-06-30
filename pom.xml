@@ -57,18 +57,8 @@
                 <artifactId>liquibase-core</artifactId>
                 <version>4.26.0</version>
             </dependency>
-            <!-- Redis -->
-            <dependency>
-                <groupId>org.springframework.boot</groupId>
-                <artifactId>spring-boot-starter-data-redis</artifactId>
-                <version>${project.parent.version}</version>
-            </dependency>
-            <!-- RabbitMQ -->
-            <dependency>
-                <groupId>org.springframework.boot</groupId>
-                <artifactId>spring-boot-starter-amqp</artifactId>
-                <version>${project.parent.version}</version>
-            </dependency>
+            <!-- Note: Redis and RabbitMQ starters are already managed by spring-boot-starter-parent,
+                 child modules can use them without specifying version -->
             <!-- JSON -->
             <dependency>
                 <groupId>com.fasterxml.jackson.core</groupId>
@@ -83,21 +73,4 @@
             </dependency>
         </dependencies>
     </dependencyManagement>
-
-    <build>
-        <plugins>
-            <plugin>
-                <groupId>org.springframework.boot</groupId>
-                <artifactId>spring-boot-maven-plugin</artifactId>
-                <configuration>
-                    <excludes>
-                        <exclude>
-                            <groupId>org.projectlombok</groupId>
-                            <artifactId>lombok</artifactId>
-                        </exclude>
-                    </excludes>
-                </configuration>
-            </plugin>
-        </plugins>
-    </build>
 </project>

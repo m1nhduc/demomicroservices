@@ -1,0 +1,156 @@
+```
+╔═══════════════════════════════════════════════════════════════════════════════╗
+║                     RABBITMQ TOPOLOGY - SAU KHI SỬA LỖI                      ║
+╚═══════════════════════════════════════════════════════════════════════════════╝
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  FLOW 1: ORDER PLACEMENT → COUPON MATCHING                                  │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+    ┌──────────────┐
+    │ Order Service│ (Producer)
+    └──────┬───────┘
+           │ publish ORDER_PLACED
+           ▼
+    ┌────────────────┐      ┌──────────────┐
+    │ order.exchange │─────→│ order.queue  │
+    └────────────────┘      └──────┬───────┘
+                                   │ consume
+                                   ▼
+                            ┌──────────────────┐
+                            │ Coupon Service   │ ✅ DECLARES order.queue
+                            │ (Consumer)       │
+                            └──────────────────┘
+                                   │ error?
+                                   ▼
+                            ┌──────────────────┐
+                            │ order.dlq.queue  │ (Manual intervention)
+                            └──────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  FLOW 2: REDEEM COMMAND → WALLET PROCESSING                                 │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+    ┌──────────────────┐
+    │  Coupon Service  │ (Producer)
+    └────────┬─────────┘
+             │ publish REDEEM_COMMAND
+             ▼
+    ┌────────────────────────┐      ┌────────────────────────┐
+    │ redeem.command.exchange│─────→│ redeem.command.queue   │
+    └────────────────────────┘      └────────┬───────────────┘
+                                             │ consume
+                                             ▼
+                                    ┌─────────────────────────┐
+                                    │ Order Service           │ ✅ DECLARES
+                                    │ (Wallet Mock Consumer)  │    redeem.command.queue
+                                    └─────────────────────────┘
+                                             │ error?
+                                             ▼
+                                    ┌─────────────────────────┐
+                                    │ redeem.command.dlq.queue│
+                                    └─────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  FLOW 3: REDEEM RESULT → COUPON UPDATE                                      │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+    ┌─────────────────────┐
+    │ Wallet Mock         │ (Producer)
+    │ (in Order Service)  │
+    └──────────┬──────────┘
+               │ publish REDEEM_RESULT
+               ▼
+    ┌────────────────────────┐      ┌────────────────────────┐
+    │ redeem.result.exchange │─────→│ redeem.result.queue    │
+    └────────────────────────┘      └─────────┬──────────────┘
+                                              │ consume
+                                              ▼
+                                    ┌─────────────────────────┐
+                                    │ Coupon Service          │ ✅ DECLARES
+                                    │ (Consumer)              │    redeem.result.queue
+                                    └─────────────────────────┘
+                                              │ error?
+                                              ▼
+                                    ┌─────────────────────────┐
+                                    │ redeem.result.dlq.queue │
+                                    └─────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  FLOW 4: NOTIFICATION EVENT                                                  │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+    ┌──────────────────┐
+    │  Coupon Service  │ (Producer)
+    └────────┬─────────┘
+             │ publish NOTIFICATION_EVENT
+             ▼
+    ┌──────────────────────┐      ┌───────────────────────┐
+    │ notification.exchange│─────→│ notification.queue    │
+    └──────────────────────┘      └────────┬──────────────┘
+                                           │ consume
+                                           ▼
+                                  ┌────────────────────────────┐
+                                  │ Notification Service       │ ✅ DECLARES
+                                  │ (Consumer)                 │    notification.queue
+                                  └────────────────────────────┘
+                                           │ error?
+                                           ▼
+                                  ┌────────────────────────────┐
+                                  │ notification.dlq.queue     │
+                                  └────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  NGUYÊN TẮC VÀNG: CONSUMER DECLARES THE QUEUE                               │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+    Producer chỉ:                Consumer phải:
+    ✅ Publish message           ✅ Declare exchange
+    ✅ Biết tên exchange          ✅ Declare queue
+                                  ✅ Declare binding
+                                  ✅ Declare DLQ
+                                  ✅ Listen to queue
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  LỢI ÍCH CỦA KIẾN TRÚC NÀY                                                  │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+    1. 🔒 SEPARATION OF CONCERNS
+       - Mỗi service chỉ quản lý queue mà nó consume
+       - Không có queue duplicate trên nhiều service
+
+    2. 🔄 IDEMPOTENCY
+       - Consumer tự control queue configuration
+       - Queue được tạo trước khi consumer start
+
+    3. 🛡️ ERROR HANDLING
+       - Mỗi queue có DLQ riêng
+       - Failed message không bị mất
+       - Admin có thể manual retry
+
+    4. 📦 LOOSE COUPLING
+       - Producer chỉ cần biết exchange name
+       - Consumer có thể thay đổi queue config tự do
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  FILE CONFIGURATION MAPPING                                                  │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+    File: coupon-service/RabbitMQConfig.java
+    ├── ✅ orderExchange/Queue/Binding
+    ├── ✅ orderDlqExchange/Queue/Binding
+    ├── ✅ redeemResultExchange/Queue/Binding
+    └── ✅ redeemResultDlqExchange/Queue/Binding
+
+    File: order-service/RabbitMQConfig.java
+    ├── ✅ redeemCommandExchange/Queue/Binding
+    └── ✅ redeemCommandDlqExchange/Queue/Binding
+
+    File: notification-service/RabbitMQConfig.java
+    ├── ✅ notificationExchange/Queue/Binding
+    └── ✅ notificationDlqExchange/Queue/Binding
+
+═══════════════════════════════════════════════════════════════════════════════
+Generated: 2026-06-29 | Author: GitHub Copilot | Status: ✅ FIXED
+═══════════════════════════════════════════════════════════════════════════════
+```

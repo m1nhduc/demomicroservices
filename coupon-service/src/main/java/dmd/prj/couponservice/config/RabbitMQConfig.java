@@ -8,7 +8,9 @@ import static dmd.prj.common.constant.RabbitMQConstant.*;
 @Configuration
 public class RabbitMQConfig {
 
-    // Order Exchanges
+    // ============================================
+    // ORDER QUEUE - Coupon Service consumes this
+    // ============================================
     @Bean
     public DirectExchange orderExchange() {
         return new DirectExchange(ORDER_EXCHANGE, true, false);
@@ -16,7 +18,9 @@ public class RabbitMQConfig {
 
     @Bean
     public Queue orderQueue() {
-        return QueueBuilder.durable(ORDER_QUEUE).build();
+        return QueueBuilder.durable(ORDER_QUEUE)
+                .deadLetterExchange(ORDER_DLQ_EXCHANGE)
+                .build();
     }
 
     @Bean
@@ -24,23 +28,25 @@ public class RabbitMQConfig {
         return BindingBuilder.bind(orderQueue).to(orderExchange).with(ORDER_ROUTING_KEY);
     }
 
-    // Redeem Command Exchanges
+    // Order Dead Letter Queue
     @Bean
-    public DirectExchange redeemCommandExchange() {
-        return new DirectExchange(REDEEM_COMMAND_EXCHANGE, true, false);
+    public DirectExchange orderDlqExchange() {
+        return new DirectExchange(ORDER_DLQ_EXCHANGE, true, false);
     }
 
     @Bean
-    public Queue redeemCommandQueue() {
-        return QueueBuilder.durable(REDEEM_COMMAND_QUEUE).build();
+    public Queue orderDlqQueue() {
+        return QueueBuilder.durable(ORDER_DLQ_QUEUE).build();
     }
 
     @Bean
-    public Binding redeemCommandBinding(Queue redeemCommandQueue, DirectExchange redeemCommandExchange) {
-        return BindingBuilder.bind(redeemCommandQueue).to(redeemCommandExchange).with(REDEEM_COMMAND_ROUTING_KEY);
+    public Binding orderDlqBinding(Queue orderDlqQueue, DirectExchange orderDlqExchange) {
+        return BindingBuilder.bind(orderDlqQueue).to(orderDlqExchange).with("order.dlq");
     }
 
-    // Redeem Result Exchanges
+    // ============================================
+    // REDEEM RESULT QUEUE - Coupon Service consumes this
+    // ============================================
     @Bean
     public DirectExchange redeemResultExchange() {
         return new DirectExchange(REDEEM_RESULT_EXCHANGE, true, false);
@@ -48,7 +54,9 @@ public class RabbitMQConfig {
 
     @Bean
     public Queue redeemResultQueue() {
-        return QueueBuilder.durable(REDEEM_RESULT_QUEUE).build();
+        return QueueBuilder.durable(REDEEM_RESULT_QUEUE)
+                .deadLetterExchange(REDEEM_RESULT_DLQ_EXCHANGE)
+                .build();
     }
 
     @Bean
@@ -56,19 +64,19 @@ public class RabbitMQConfig {
         return BindingBuilder.bind(redeemResultQueue).to(redeemResultExchange).with(REDEEM_RESULT_ROUTING_KEY);
     }
 
-    // Notification Exchanges
+    // Redeem Result Dead Letter Queue
     @Bean
-    public DirectExchange notificationExchange() {
-        return new DirectExchange(NOTIFICATION_EXCHANGE, true, false);
+    public DirectExchange redeemResultDlqExchange() {
+        return new DirectExchange(REDEEM_RESULT_DLQ_EXCHANGE, true, false);
     }
 
     @Bean
-    public Queue notificationQueue() {
-        return QueueBuilder.durable(NOTIFICATION_QUEUE).build();
+    public Queue redeemResultDlqQueue() {
+        return QueueBuilder.durable(REDEEM_RESULT_DLQ_QUEUE).build();
     }
 
     @Bean
-    public Binding notificationBinding(Queue notificationQueue, DirectExchange notificationExchange) {
-        return BindingBuilder.bind(notificationQueue).to(notificationExchange).with(NOTIFICATION_ROUTING_KEY);
+    public Binding redeemResultDlqBinding(Queue redeemResultDlqQueue, DirectExchange redeemResultDlqExchange) {
+        return BindingBuilder.bind(redeemResultDlqQueue).to(redeemResultDlqExchange).with("redeem.result.dlq");
     }
 }
